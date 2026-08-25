@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 
-from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.stream import StreamTransformer
 from typing_extensions import override
 
@@ -35,6 +35,8 @@ if TYPE_CHECKING:
     from langgraph.runtime import Runtime
     from langgraph.stream._types import ProtocolEvent
 
+
+_MessageT = TypeVar("_MessageT", bound=BaseMessage)
 
 _DEFAULT_STREAM_LOOKBACK = 128
 """Default trailing-buffer size for cross-delta PII detection.
@@ -660,13 +662,51 @@ class PIIMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, ResponseT])
         """Name of the middleware."""
         return f"{self.__class__.__name__}[{self.pii_type}]"
 
-    def _process_content(self, content: str) -> tuple[str, list[PIIMatch]]:
-        """Apply the configured redaction rule to the provided content."""
-        matches = self.detector(content)
-        if not matches:
-            return content, []
-        sanitized = apply_strategy(content, matches, self.strategy)
-        return sanitized, matches
+    def _redact_content_value(self, value: Any) -> Any:
+        """Recursively redact PII in the string leaves of message content.
+
+        Preserves the structure of `value`: `str` leaves that contain PII
+        are replaced (or emptied/raised under `block`) via `apply_strategy`,
+        while `dict`/`list`/`tuple` containers are rebuilt with redacted
+        leaves. This lets list-of-content-blocks content (e.g.
+        `[{"type": "text", "text": "..."}]`) be redacted in place instead of
+        being flattened into its `repr`.
+        """
+        if isinstance(value, str):
+            if not value:
+                return value
+            matches = self.detector(value)
+            if not matches:
+                return value
+            return apply_strategy(value, matches, self.strategy)
+        if isinstance(value, dict):
+            return {k: self._redact_content_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._redact_content_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self._redact_content_value(v) for v in value)
+        return value
+
+    def _redact_message(self, message: _MessageT) -> _MessageT:
+        """Return `message` with `.content` redacted, preserving its shape.
+
+        Handles both plain-string and list-of-content-blocks `.content`.
+        Returns the original object unchanged (same identity) when no PII is
+        detected, so callers can cheaply detect whether a rewrite happened.
+        """
+        content = message.content
+        if isinstance(content, str) and content:
+            matches = self.detector(content)
+            if not matches:
+                return message
+            new_content: Any = apply_strategy(content, matches, self.strategy)
+        elif isinstance(content, list) and content:
+            new_content = self._redact_content_value(content)
+            if new_content == content:
+                return message
+        else:
+            return message
+        return message.model_copy(update={"content": new_content})
 
     @hook_config(can_jump_to=["end"])
     @override
@@ -710,17 +750,13 @@ class PIIMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, ResponseT])
                     break
 
             if last_user_idx is not None and last_user_msg and last_user_msg.content:
-                # Detect PII in message content
-                content = str(last_user_msg.content)
-                new_content, matches = self._process_content(content)
+                # Redact PII while preserving the original content shape.
+                # `_redact_message` handles both plain-string and
+                # list-of-content-blocks `.content`, so a structured message
+                # is not flattened into the `repr` of its content blocks.
+                updated_message = self._redact_message(last_user_msg)
 
-                if matches:
-                    updated_message: AnyMessage = HumanMessage(
-                        content=new_content,
-                        id=last_user_msg.id,
-                        name=last_user_msg.name,
-                    )
-
+                if updated_message is not last_user_msg:
                     new_messages[last_user_idx] = updated_message
                     any_modified = True
 
@@ -742,21 +778,14 @@ class PIIMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, ResponseT])
                         if not tool_msg.content:
                             continue
 
-                        content = str(tool_msg.content)
-                        new_content, matches = self._process_content(content)
+                        # Redact PII while preserving the original content
+                        # shape (plain string or list-of-content-blocks).
+                        updated_tool_msg = self._redact_message(tool_msg)
 
-                        if not matches:
+                        if updated_tool_msg is tool_msg:
                             continue
 
-                        # Create updated tool message
-                        updated_message = ToolMessage(
-                            content=new_content,
-                            id=tool_msg.id,
-                            name=tool_msg.name,
-                            tool_call_id=tool_msg.tool_call_id,
-                        )
-
-                        new_messages[i] = updated_message
+                        new_messages[i] = updated_tool_msg
                         any_modified = True
 
         if any_modified:
@@ -824,20 +853,12 @@ class PIIMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, ResponseT])
         if last_ai_idx is None or not last_ai_msg or not last_ai_msg.content:
             return None
 
-        # Detect PII in message content
-        content = str(last_ai_msg.content)
-        new_content, matches = self._process_content(content)
+        # Redact PII while preserving the original content shape (plain
+        # string or list-of-content-blocks).
+        updated_message = self._redact_message(last_ai_msg)
 
-        if not matches:
+        if updated_message is last_ai_msg:
             return None
-
-        # Create updated message
-        updated_message = AIMessage(
-            content=new_content,
-            id=last_ai_msg.id,
-            name=last_ai_msg.name,
-            tool_calls=last_ai_msg.tool_calls,
-        )
 
         # Return updated messages
         new_messages = list(messages)

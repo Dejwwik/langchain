@@ -551,6 +551,70 @@ class TestPIIMiddlewareIntegration:
         messages = result["messages"]
         assert any("[REDACTED_EMAIL]" in str(msg.content) for msg in messages)
 
+    def test_input_list_content_preserved(self) -> None:
+        """List-of-content-blocks input is redacted in place, not stringified.
+
+        Regression: `before_model` used `str(msg.content)`, which flattened
+        block-list content into its `repr` (e.g. the stored content became
+        the literal string `"[{'type': 'text', 'text': '...'}]"`) instead of
+        redacting the text block and preserving the list shape.
+        """
+        middleware = PIIMiddleware("email", strategy="redact")
+        state = AgentState[Any](
+            messages=[
+                HumanMessage(content=[{"type": "text", "text": "my email is test@example.com"}])
+            ]
+        )
+
+        result = middleware.before_model(state, Runtime())
+
+        assert result is not None
+        content = result["messages"][0].content
+        assert content == [{"type": "text", "text": "my email is [REDACTED_EMAIL]"}]
+        assert "test@example.com" not in str(content)
+
+    def test_output_list_content_preserved(self) -> None:
+        """List-of-content-blocks AI output is redacted in place, not stringified."""
+        middleware = PIIMiddleware(
+            "email", strategy="redact", apply_to_input=False, apply_to_output=True
+        )
+        state = AgentState[Any](
+            messages=[AIMessage(content=[{"type": "text", "text": "reach me at ai@example.com"}])]
+        )
+
+        result = middleware.after_model(state, Runtime())
+
+        assert result is not None
+        content = result["messages"][0].content
+        assert content == [{"type": "text", "text": "reach me at [REDACTED_EMAIL]"}]
+        assert "ai@example.com" not in str(content)
+
+    def test_tool_result_list_content_preserved(self) -> None:
+        """List-of-content-blocks tool results are redacted in place."""
+        middleware = PIIMiddleware(
+            "email", strategy="redact", apply_to_input=False, apply_to_tool_results=True
+        )
+        state = AgentState[Any](
+            messages=[
+                HumanMessage("Search for user"),
+                AIMessage(
+                    content="",
+                    tool_calls=[ToolCall(name="search", args={}, id="call_1", type="tool_call")],
+                ),
+                ToolMessage(
+                    content=[{"type": "text", "text": "found: john@example.com"}],
+                    tool_call_id="call_1",
+                ),
+            ]
+        )
+
+        result = middleware.before_model(state, Runtime())
+
+        assert result is not None
+        content = result["messages"][2].content
+        assert content == [{"type": "text", "text": "found: [REDACTED_EMAIL]"}]
+        assert "john@example.com" not in str(content)
+
 
 class TestCustomDetector:
     """Test custom detector functionality."""
